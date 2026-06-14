@@ -9,6 +9,9 @@ HUB_IMAGE="ghcr.io/securius-core/securius-hub:latest"
 HUB_PORT="48080"
 DATA_VOL="hub_data"
 HOST_SOCKET="/var/run/docker.sock"
+CHANNEL_VOL="securius-update-channel"
+UPDATER_NAME="securius-hub-updater"
+UPDATER_IMAGE="ghcr.io/securius-core/securius-hub-updater:latest"
 OCTET_HIGH=98
 OCTET_LOW=50
 
@@ -220,6 +223,19 @@ create_suite_network() {
   fi
 }
 
+# Shared volume the Hub and the updater sidecar exchange update-request/status files
+# through. Must exist before either container mounts it. Idempotent.
+ensure_channel_volume() {
+  info "Ensuring update channel volume '$CHANNEL_VOL'"
+  if $DOCKER volume inspect "$CHANNEL_VOL" >/dev/null 2>&1; then
+    ok "'$CHANNEL_VOL' already exists"
+  else
+    $DOCKER volume create "$CHANNEL_VOL" >/dev/null \
+      || die "Failed to create volume '$CHANNEL_VOL'."
+    ok "Created volume '$CHANNEL_VOL'"
+  fi
+}
+
 create_lan_network() {
   info "Ensuring LAN network '$LAN_NET'"
 
@@ -280,6 +296,11 @@ start_hub() {
     container_running || { $DOCKER start "$HUB_NAME" >/dev/null && ok "Started existing '$HUB_NAME'"; }
   else
     info "Starting Hub on '$SUITE_NET'"
+    # The $CHANNEL_VOL mount at /channel is how Hub hands self-update requests to the
+    # securius-hub-updater sidecar. The updater recreates Hub from its LIVE config
+    # (docker inspect), so this mount — like the LAN IP, ports and /data — carries
+    # through any future self-update automatically: the running Hub container is the
+    # single source of truth for its own spec.
     $DOCKER run -d \
       --name "$HUB_NAME" \
       --restart unless-stopped \
@@ -290,6 +311,7 @@ start_hub() {
       -e DATA_DIR=/data \
       -v "$HOST_SOCKET:$HOST_SOCKET" \
       -v "$DATA_VOL:/data" \
+      -v "$CHANNEL_VOL:/channel" \
       "$HUB_IMAGE" >/dev/null \
       || die "Failed to start the Hub container."
     ok "Hub container started"
@@ -311,11 +333,38 @@ start_hub() {
   fi
 }
 
+# The self-update sidecar. It recreates the Hub container on request (Hub can't replace
+# its own running process). It needs ONLY the Docker socket + the shared channel volume —
+# no ports, no LAN IP, no special network (identical on QNAP and standard Linux). Mirrors
+# start_hub's re-run handling: skip if it already exists, just start it if it's stopped.
+start_updater() {
+  info "Pulling updater image (public, no login required)"
+  $DOCKER pull "$UPDATER_IMAGE" >/dev/null || die "Failed to pull $UPDATER_IMAGE"
+  ok "Image ready"
+
+  if $DOCKER ps -a --format '{{.Names}}' | grep -qx "$UPDATER_NAME"; then
+    warn "Container '$UPDATER_NAME' already exists — not recreating."
+    [ "$($DOCKER inspect -f '{{.State.Running}}' "$UPDATER_NAME" 2>/dev/null)" = "true" ] \
+      || { $DOCKER start "$UPDATER_NAME" >/dev/null && ok "Started existing '$UPDATER_NAME'"; }
+  else
+    info "Starting Hub updater sidecar"
+    $DOCKER run -d \
+      --name "$UPDATER_NAME" \
+      --restart unless-stopped \
+      -v "$HOST_SOCKET:$HOST_SOCKET" \
+      -v "$CHANNEL_VOL:/channel" \
+      "$UPDATER_IMAGE" >/dev/null \
+      || die "Failed to start the updater container."
+    ok "Updater sidecar started"
+  fi
+}
+
 summary() {
   printf "\n%b\n" "${C_G}${C_B}Securius Hub is up.${C_0}"
   printf "  Open:      %bhttp://%s:%s%b\n" "$C_B" "$HUB_IP" "$HUB_PORT" "$C_0"
   printf "  LAN IP:    %s  (interface %s, gateway %s)\n" "$HUB_IP" "$IFACE" "$GATEWAY"
   printf "  Networks:  %s (LAN) + %s (internal)\n" "$LAN_NET" "$SUITE_NET"
+  printf "  Updater:   %s installed — Hub can update itself from its UI\n" "$UPDATER_NAME"
   printf "\n"
   printf "  From here, install Shield and other products in the Hub UI. Any passwords\n"
   printf "  (e.g. your Pi-hole password) are entered there — never in this installer.\n"
@@ -333,7 +382,9 @@ main() {
   pick_hub_ip
   create_suite_network
   create_lan_network
+  ensure_channel_volume
   start_hub
+  start_updater
   summary
 }
 
