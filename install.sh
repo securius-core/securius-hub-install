@@ -12,6 +12,14 @@ HOST_SOCKET="/var/run/docker.sock"
 CHANNEL_VOL="securius-update-channel"
 UPDATER_NAME="securius-hub-updater"
 UPDATER_IMAGE="ghcr.io/securius-core/securius-hub-updater:latest"
+# QNAP's inherited container DNS (host 10.0.3.1, via Docker's embedded resolver) resolves
+# names intermittently → EAI_AGAIN. The infra containers that reach the internet BY NAME
+# (Hub → api.securius.net; updater → ghcr.io) use explicit reliable resolvers instead.
+# On the user-defined securius-suite network, --dns only changes the embedded resolver's
+# UPSTREAM — Hub's container-name resolution (→ products) still works. Pi-hole is NOT
+# touched here: it keeps its own Dns config (127.0.0.1 + upstream) from Hub's Branch A spec.
+DNS_PRIMARY="1.1.1.1"
+DNS_FALLBACK="8.8.8.8"
 OCTET_HIGH=98
 OCTET_LOW=50
 
@@ -304,6 +312,8 @@ start_hub() {
     $DOCKER run -d \
       --name "$HUB_NAME" \
       --restart unless-stopped \
+      --dns "$DNS_PRIMARY" \
+      --dns "$DNS_FALLBACK" \
       --network "$SUITE_NET" \
       -p 48080-48090:48080-48090 \
       -e PORT="$HUB_PORT" \
@@ -351,6 +361,8 @@ start_updater() {
     $DOCKER run -d \
       --name "$UPDATER_NAME" \
       --restart unless-stopped \
+      --dns "$DNS_PRIMARY" \
+      --dns "$DNS_FALLBACK" \
       -v "$HOST_SOCKET:$HOST_SOCKET" \
       -v "$CHANNEL_VOL:/channel" \
       "$UPDATER_IMAGE" >/dev/null \
