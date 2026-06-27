@@ -7,6 +7,17 @@ SUITE_NET="securius-suite"
 HUB_NAME="securius-hub"
 HUB_IMAGE="ghcr.io/securius-core/securius-hub:latest"
 HUB_PORT="48080"
+# mDNS name the Hub is reached by. The Hub CONTAINER (image ≥0.3.1) runs avahi and
+# advertises this name on its OWN IP. When Hub gets a macvlan LAN IP, Docker disables the
+# container's host-port publishing, so the container's macvlan IP is the only reachable
+# path — the container MUST own securius-hub.local. But if the HOST is also named
+# securius-hub it publishes securius-hub.local at the (unreachable) host IP and WINS the
+# mDNS name, forcing the container to rename to securius-hub-2.local. So on the
+# macvlan-success path we yield the name from the host by renaming it to $HOST_ALT_NAME.
+HUB_HOSTNAME="securius-hub"
+HOST_ALT_NAME="securius-device"
+# Set true once Hub actually holds its macvlan/qnet LAN IP (see start_hub).
+MACVLAN_OK="false"
 DATA_VOL="hub_data"
 HOST_SOCKET="/var/run/docker.sock"
 CHANNEL_VOL="securius-update-channel"
@@ -34,6 +45,12 @@ warn() { printf "%b\n" "${C_Y}  ! ${C_0} $*" >&2; }
 die()  { printf "%b\n" "${C_R}ERROR:${C_0} $*" >&2; exit 1; }
 
 DOCKER="docker"
+
+# Root wrapper for the few non-Docker host commands (hostnamectl, systemctl, editing
+# /etc/hosts) used by the mDNS-ownership step. Empty when already root; "sudo" otherwise.
+# If neither applies the mDNS step degrades gracefully (warns + skips).
+SUDO=""
+[ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && SUDO="sudo"
 
 HOST_TYPE="linux"
 detect_host_type() {
@@ -329,10 +346,12 @@ start_hub() {
 
   if on_network "$LAN_NET"; then
     ok "Hub already attached to '$LAN_NET'"
+    MACVLAN_OK="true"
   else
     info "Attaching Hub to '$LAN_NET' at $HUB_IP"
     if $DOCKER network connect --ip "$HUB_IP" "$LAN_NET" "$HUB_NAME" >/dev/null 2>&1; then
       ok "Hub attached to LAN at $HUB_IP"
+      MACVLAN_OK="true"
     elif [ "$HOST_TYPE" = "qnap" ]; then
       die "Could not attach Hub to the qnet network with a static IP from the CLI.
      In Container Station, attach the '$HUB_NAME' container to your qnet network and
@@ -340,6 +359,82 @@ start_hub() {
     else
       lan_die "Could not attach Hub to '$LAN_NET' at $HUB_IP."
     fi
+  fi
+}
+
+# Restart the host's avahi-daemon so it re-announces under the (just-changed) hostname.
+# Best-effort: only acts if systemd + an active avahi-daemon are present.
+restart_host_avahi() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl is-active --quiet avahi-daemon 2>/dev/null || return 0
+  if $SUDO systemctl restart avahi-daemon >/dev/null 2>&1; then
+    ok "Host avahi-daemon restarted"
+  else
+    warn "Could not restart host avahi-daemon (mDNS ownership may take a moment to settle)."
+  fi
+}
+
+# Ensure EXACTLY ONE publisher owns securius-hub.local, decided by whether Hub got its
+# macvlan/qnet LAN IP:
+#   macvlan UP   -> the Hub CONTAINER must own the name (its macvlan IP is the only
+#                   reachable path, since Docker disables the container's host-port
+#                   publishing under macvlan). If the HOST is named securius-hub it would
+#                   steal the name, so rename the host to securius-device + restart host
+#                   avahi to yield it, then restart Hub so its avahi re-claims the freed
+#                   name at the macvlan IP.
+#   macvlan DOWN -> the HOST keeps securius-hub.local (host-port publishing works in this
+#                   fallback), so leave everything; the container avahi harmlessly renames.
+# Scope: only touches the hostname on standard Linux where WE set it to securius-hub (our
+# dedicated image / Armbian build). On a NAS or a user's own box (hostname != securius-hub)
+# the host never claims the name, so there is nothing to do and we NEVER rename their host.
+configure_mdns_ownership() {
+  info "Configuring mDNS ownership of ${HUB_HOSTNAME}.local (macvlan: ${MACVLAN_OK})"
+
+  if [ "$MACVLAN_OK" != "true" ]; then
+    # Bridge-only fallback: the HOST keeps securius-hub.local (host-port publishing works
+    # here), and the Hub container (image ≥0.3.2, SECURIUS_MDNS=auto) detects it is
+    # bridge-only and does NOT advertise — so there is no collision. Nothing to do.
+    info "macvlan not active — host keeps ${HUB_HOSTNAME}.local (host-port path); container stays silent. No change."
+    return 0
+  fi
+
+  # macvlan IS up: the Hub CONTAINER must own securius-hub.local at its LAN IP (Docker
+  # disables the container's host-port publishing under macvlan, so the macvlan IP is the
+  # only reachable path).
+  #
+  # 1) Make sure the HOST doesn't also claim the name. Only OUR dedicated standard-Linux
+  #    image is named securius-hub; a NAS/user host is named something else and never
+  #    claims it (so we NEVER rename a NAS or a user's box).
+  if ! is_nas && command -v hostnamectl >/dev/null 2>&1; then
+    cur="$( (hostnamectl --static 2>/dev/null || hostname 2>/dev/null) | head -n1 )"
+    if [ "$cur" = "$HUB_HOSTNAME" ]; then
+      info "Yielding ${HUB_HOSTNAME}.local from the host (renaming host to ${HOST_ALT_NAME})"
+      if $SUDO hostnamectl set-hostname "$HOST_ALT_NAME" >/dev/null 2>&1; then
+        ok "Host renamed to ${HOST_ALT_NAME}"
+        if [ -f /etc/hosts ]; then
+          $SUDO sed -i "s/\b${HUB_HOSTNAME}\b/${HOST_ALT_NAME}/g" /etc/hosts 2>/dev/null \
+            && ok "Updated /etc/hosts (${HUB_HOSTNAME} -> ${HOST_ALT_NAME})" \
+            || warn "Could not update /etc/hosts."
+        fi
+        restart_host_avahi
+      else
+        warn "Could not change the host hostname — ${HUB_HOSTNAME}.local may resolve to the (unreachable) host IP."
+      fi
+    else
+      info "Host is '${cur:-unknown}' (not ${HUB_HOSTNAME}) — no collision; the Hub container will own ${HUB_HOSTNAME}.local."
+    fi
+  else
+    info "NAS / no hostnamectl — not renaming the host; the Hub container owns ${HUB_HOSTNAME}.local on its LAN IP."
+  fi
+
+  # 2) Restart Hub so its entrypoint RE-DETECTS the macvlan interface (attached AFTER the
+  #    initial container start) and brings avahi up to claim ${HUB_HOSTNAME}.local at the
+  #    LAN IP. Required in BOTH the rename and the no-rename (NAS) cases. Networks + static
+  #    IP are preserved across a restart; image ≥0.3.2 clears stale dbus state on start.
+  if $DOCKER restart "$HUB_NAME" >/dev/null 2>&1; then
+    ok "Hub restarted — its avahi now owns ${HUB_HOSTNAME}.local at ${HUB_IP}"
+  else
+    warn "Could not restart Hub to enable mDNS; it will enable on its next restart."
   fi
 }
 
@@ -396,6 +491,7 @@ main() {
   create_lan_network
   ensure_channel_volume
   start_hub
+  configure_mdns_ownership
   start_updater
   summary
 }
