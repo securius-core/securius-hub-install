@@ -235,6 +235,28 @@ pick_hub_ip() {
   ok "Chose $HUB_IP for Hub"
 }
 
+# Resolve the IP to use/report for Hub. On a re-run where Hub already exists, free-IP
+# SELECTION would pick a DIFFERENT free address than the one the running Hub actually holds
+# (the existing Hub's IP shows as "in use"), and the summary would then print the wrong IP.
+# So: if Hub exists, read its ACTUAL LAN IP from its (non-suite) network attachment and skip
+# selection. Falls back to pick_hub_ip on a fresh install, or if an existing Hub has no LAN
+# IP yet (so start_hub's attach has a candidate).
+resolve_hub_ip() {
+  if container_exists; then
+    local existing
+    existing="$($DOCKER inspect "$HUB_NAME" --format \
+      '{{range $net, $cfg := .NetworkSettings.Networks}}{{if ne $net "'"$SUITE_NET"'"}}{{$cfg.IPAddress}} {{end}}{{end}}' 2>/dev/null \
+      | tr ' ' '\n' | grep -E '^[0-9]+\.' | head -n1)"
+    if [ -n "$existing" ]; then
+      HUB_IP="$existing"
+      ok "Hub already installed — using its current LAN IP $HUB_IP (skipping IP selection)"
+      return
+    fi
+    warn "Hub exists but has no LAN IP yet — selecting one."
+  fi
+  pick_hub_ip
+}
+
 net_exists() { $DOCKER network inspect "$1" >/dev/null 2>&1; }
 
 create_suite_network() {
@@ -486,7 +508,7 @@ main() {
   detect_host_type
   ensure_docker
   detect_lan
-  pick_hub_ip
+  resolve_hub_ip
   create_suite_network
   create_lan_network
   ensure_channel_volume
